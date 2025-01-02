@@ -28,6 +28,8 @@ class HalfCheetahMassEnv(HalfCheetahEnv):
         self._idx = 0
         if not self._task:
             self._task = self.tasks[0]
+        self._curr_steps = n_tasks * [0]
+        self._curr_return = n_tasks * [0]
         super(HalfCheetahMassEnv, self).__init__()
         self.original_mass_vec = self.model.body_mass.copy()  # 8 elements
         self.set_task()

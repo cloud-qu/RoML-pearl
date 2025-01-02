@@ -30,6 +30,8 @@ class HalfCheetahVelEnv(HalfCheetahEnv):
             self._task = self.tasks[0]
         self._goal_vel = self.tasks[0].get('velocity', 0.0)
         self._goal = self._goal_vel
+        self._curr_steps = n_tasks * [0]
+        self._curr_return = n_tasks * [0]
         super(HalfCheetahVelEnv, self).__init__()
 
         self._curr_steps = n_tasks * [0]

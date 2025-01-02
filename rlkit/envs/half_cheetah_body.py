@@ -28,6 +28,8 @@ class HalfCheetahBodyEnv(HalfCheetahEnv):
         self._idx = 0
         if not self._task:
             self._task = self.tasks[0]
+        self._curr_steps = n_tasks * [0]
+        self._curr_return = n_tasks * [0]
         super(HalfCheetahBodyEnv, self).__init__()
 
         # save original cheetah properties (tasks are defined as ratios of these)

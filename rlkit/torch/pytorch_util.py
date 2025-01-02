@@ -78,7 +78,7 @@ def set_gpu_mode(mode, gpu_id=0):
     global _gpu_id
     _gpu_id = gpu_id
     _use_gpu = mode
-    device = torch.device("cuda:0" if _use_gpu else "cpu")
+    device = torch.device("cuda" if _use_gpu else "cpu")
     if _use_gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(_gpu_id)
 

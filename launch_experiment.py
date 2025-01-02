@@ -74,6 +74,7 @@ def experiment(variant):
     n_train = variant['n_train_tasks']
     n_valid = variant['n_eval_tasks']
     n_test = variant['n_test_tasks']
+    variant['algo_params']['gpu_id'] = variant['util_params']['gpu_id']
     algorithm = PEARLSoftActorCritic(
             env=env,
             train_tasks=list(tasks[:n_train]),
@@ -98,6 +99,7 @@ def experiment(variant):
     # optional GPU mode
     ptu.set_gpu_mode(variant['util_params']['use_gpu'], variant['util_params']['gpu_id'])
     if ptu.gpu_enabled():
+        ptu.device = torch.device('cuda:{}'.format(variant['util_params']['gpu_id']))
         algorithm.to()
 
     # debugging triggers a lot of printing and logs to a debug directory
@@ -140,7 +142,14 @@ def deep_update_dict(fr, to):
 @click.option('--num_iterations', default=None)
 @click.option('--seed', default=None)
 @click.option('--use_cem', default=False)
-def main(config, gpu, docker, debug, use_wandb, n_test_tasks, num_iterations, seed, use_cem):
+@click.option('--framework', default=0, type=int)#0:pearl, 1:roml, 2:mpts
+@click.option('--gamma_2', default=0, type=float)
+@click.option('--diverse_sample_ratio', default=0, type=float)
+@click.option('--posterior_sampling', default=1, type=int)
+@click.option('--diversity_type', default='rs', type=str)
+def main(config, gpu, docker, debug, use_wandb, n_test_tasks, num_iterations, seed, use_cem, framework, gamma_2, diverse_sample_ratio, diversity_type, posterior_sampling):
+    if framework != 1:
+        use_cem = False
     variant = default_config
     if n_test_tasks is not None:
         variant['n_test_tasks'] = int(n_test_tasks)
@@ -155,6 +164,11 @@ def main(config, gpu, docker, debug, use_wandb, n_test_tasks, num_iterations, se
             exp_params = json.load(f)
         variant = deep_update_dict(exp_params, variant)
     variant['util_params']['gpu_id'] = gpu
+    variant['algo_params']['framework'] = framework
+    variant['algo_params']['gamma_2'] = gamma_2
+    variant['algo_params']['diverse_sample_ratio'] = diverse_sample_ratio
+    variant['algo_params']['diversity_type'] = diversity_type if diversity_type != 'none' else None
+    variant['algo_params']['posterior_sampling'] = posterior_sampling
     if use_wandb:
         ngc_run = os.path.isdir('/ws')
         if ngc_run:

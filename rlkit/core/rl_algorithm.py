@@ -7,7 +7,7 @@ import pickle as pkl
 import gtimer as gt
 import numpy as np
 import wandb
-
+import torch
 import cross_entropy_sampler as cem
 from rlkit.core import logger, eval_util
 from rlkit.data_management.env_replay_buffer import MultiTaskReplayBuffer
@@ -55,6 +55,12 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             alpha=0.05,
             use_cem=True,
             seed=0,
+            framework=0,
+            gpu_id=0,
+            gamma_2=0,
+            diverse_sample_ratio=5,
+            diversity_type=None,
+            posterior_sampling=1,
             ):
         """
         :param env: training env
@@ -101,6 +107,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         self.render_eval_paths = render_eval_paths
         self.dump_eval_paths = dump_eval_paths
         self.plotter = plotter
+        self.framework = framework
 
         print('n_tasks:', len(self.env.tasks))
         print('iterations:', self.num_iterations)
@@ -131,6 +138,67 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         self.cem = None
         if use_cem:
             self.cem = cem.get_cem_sampler(env_name=self.env_name, alpha=self.alpha)
+            
+        if self.framework >= 2:
+            from MPModel.risklearner import RiskLearner
+            from MPModel.new_trainer_risklearner import RiskLearnerTrainer
+            identifier_shape = 0
+            for key in self.env.tasks[0].keys():
+                identifier_shape += self.env.tasks[0][key].shape[0] if isinstance(self.env.tasks[0][key], np.ndarray) else 1
+            device = 'cuda:{}'.format(gpu_id)
+            risklearner = RiskLearner(identifier_shape, 1, 10, 10, 10).to(device)
+            risklearner_optimizer = torch.optim.Adam(risklearner.parameters(), lr=0.005)
+            envs = {'HalfCheetahBodyEnv':'cheetah-body', 'HalfCheetahMassEnv':'cheetah-mass', 'HalfCheetahVelEnv':'cheetah-vel'}
+            env_name = envs[self.env_name]
+
+            import argparse
+            args = argparse.Namespace()
+            args.sampling_gamma_0 = 1
+            args.sampling_gamma_1 = 5
+            args.seed = seed
+            args.warmup = 50
+            args.random_ratio = 0.5
+            args.random_repeat = True
+            args.device = device
+            args.kl_weight = 0.0001
+            args.num_subset_candidates = 200000
+            self.args = args 
+
+            if self.framework == 2:
+                from MPModel.sampler import MP_BatchSampler
+                sample_ratio = {'HalfCheetahBodyEnv':5, 'HalfCheetahMassEnv':2, 'HalfCheetahVelEnv':2}
+                args.sample_ratio = sample_ratio[self.env_name]
+                args.add_random = True
+                args.posterior_sampling = False
+                diversity_type = None
+                risklearner_trainer = RiskLearnerTrainer(device, risklearner, risklearner_optimizer, kl_weight=args.kl_weight,
+                                                        num_subset_candidates=args.num_subset_candidates, posterior_sampling=args.posterior_sampling, 
+                                                        diversity_type=diversity_type, worst_preserve_ratio=0.0)
+                sampler = MP_BatchSampler(args, risklearner_trainer, 
+                                        args.sampling_gamma_0,
+                                        args.sampling_gamma_1,
+                                        env_name, 
+                                batch_size=30, 
+                                device=device, seed=args.seed)
+                
+            elif self.framework == 3:
+                from MPModel.sampler import Diverse_MP_BatchSampler
+                args.sampling_gamma_2 = gamma_2
+                args.sample_ratio = diverse_sample_ratio
+                args.add_random = False
+                args.posterior_sampling = posterior_sampling
+                risklearner_trainer = RiskLearnerTrainer(device, risklearner, risklearner_optimizer, kl_weight=args.kl_weight,
+                                                        num_subset_candidates=args.num_subset_candidates, posterior_sampling=args.posterior_sampling, 
+                                                        diversity_type=diversity_type, worst_preserve_ratio=0.0)
+                sampler = Diverse_MP_BatchSampler(args, risklearner_trainer, 
+                                          args.sampling_gamma_0,
+                                  args.sampling_gamma_1,
+                                  args.sampling_gamma_2,
+                                  env_name, 
+                           batch_size=30, 
+                           device=args.device, seed=args.seed)
+                
+            self.mp_sampler = sampler
 
         self._n_env_steps_total = 0
         self._n_train_steps_total = 0
@@ -179,11 +247,19 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             if it_ == 0:
                 print('collecting initial pool of data for train and eval')
                 # temp for evaluating
-                for idx in self.train_tasks:
+                if self.framework == 2:
+                    sampled_tasks_dict, sampled_tasks = self.mp_sampler.sample_tasks(it_, len(self.train_tasks), None)
+                    task_returns = []
+                if self.framework == 3:
+                    sampled_tasks_dict, sampled_tasks, diversified_score, combine_local_diverse_score, combine_local_acquisition_score = self.mp_sampler.sample_tasks(it_, len(self.train_tasks), None)
+                    task_returns = []
+                for i, idx in enumerate(self.train_tasks):
                     self.task_idx = idx
                     if self.cem is not None:
                         task = self.cem.sample()[0]
                         self.env.reset_task(idx, task=task)
+                    elif self.framework == 2 or self.framework == 3:
+                        self.env.reset_task(idx, task=sampled_tasks[i])
                     else:
                         self.env.reset_task(idx, resample_task=self.resample_tasks)
                     # self.env.reset_task(idx)
@@ -192,14 +268,33 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
 
                     if self.cem is not None:
                         self.cem.update(self.env.get_task_return(idx))
+                    if self.framework == 2 or self.framework == 3:
+                        task_returns.append(self.env.get_task_return(idx))
+                if self.framework == 2 or self.framework == 3:
+                    y = -torch.tensor(task_returns).to(self.args.device)
+                    y = (y-y.mean())/y.std()
+                    self.mp_sampler.train(sampled_tasks_dict, y)
 
             # Sample data from train tasks.
+            if self.framework == 2:
+                sampled_tasks_dict, sampled_tasks = self.mp_sampler.sample_tasks(it_, self.num_tasks_sample, None)
+                task_returns = []
+            if self.framework == 3:
+                sampled_tasks_dict, sampled_tasks, diversified_score, combine_local_diverse_score, combine_local_acquisition_score = self.mp_sampler.sample_tasks(it_, self.num_tasks_sample, None)
+                task_returns = []
+                if diversified_score is not None:
+                    wandb.log({'selected_diversified_score': diversified_score, 
+                            'selected_local_diverse_score': combine_local_diverse_score, 
+                            'selected_local_acquisition_score': combine_local_acquisition_score,
+                            'epoch': it_})
             for i in range(self.num_tasks_sample):
                 idx = np.random.randint(len(self.train_tasks))
                 self.task_idx = idx
                 if self.cem is not None:
-                    task = self.cem.sample()[0]
+                    task = self.cem.sample()[0] #a float number or an array
                     self.env.reset_task(idx, task=task)
+                elif self.framework == 2 or self.framework == 3:
+                    self.env.reset_task(idx, task=sampled_tasks[i])
                 else:
                     self.env.reset_task(idx, resample_task=self.resample_tasks)
                 self.enc_replay_buffer.task_buffers[idx].clear()
@@ -216,6 +311,12 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
 
                 if self.cem is not None:
                     self.cem.update(self.env.get_task_return(idx))
+                if self.framework == 2 or self.framework == 3:
+                    task_returns.append(self.env.get_task_return(idx))
+            if self.framework == 2 or self.framework == 3:
+                y = -torch.tensor(task_returns).to(self.args.device)
+                y = (y-y.mean())/y.std()
+                self.mp_sampler.train(sampled_tasks_dict, y)
 
             # Sample train tasks and compute gradient updates on parameters.
             for train_step in range(self.num_train_steps_per_itr):
@@ -491,7 +592,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
 
         ### test tasks
         eval_util.dprint('evaluating on {} test tasks'.format(len(test_indices)))
-        test_final_returns, test_online_returns = self._do_eval(test_indices, epoch)
+        test_final_returns, test_online_returns = self._do_eval(test_indices, epoch)#[30], [(array(3))*30]
         eval_util.dprint('test online returns')
         eval_util.dprint(test_online_returns)
 
@@ -526,6 +627,19 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         self.eval_statistics['AverageReturn_all_test_tasks'] = avg_test_return
         self.eval_statistics['CvarReturn_all_test_tasks'] = cvar_test_return
         logger.save_extra_data(avg_test_online_return, path='online-test-epoch{}'.format(epoch))
+        if epoch == '-final':
+            cvar90_test_return = cvar(avg_test_return_per_task, 0.1)
+            cvar70_test_return = cvar(avg_test_return_per_task, 0.3)
+            cvar50_test_return = cvar(avg_test_return_per_task, 0.5)
+            
+            wandb.log({'final_AverageReturn_all_test_tasks': avg_test_return, 
+                       'final_Cvar0.95Return_all_test_tasks': cvar_test_return, 
+                       'final_Cvar0.9Return_all_test_tasks': cvar90_test_return,
+                          'final_Cvar0.7Return_all_test_tasks': cvar70_test_return,
+                            'final_Cvar0.5Return_all_test_tasks': cvar50_test_return,})
+        else:
+            wandb.log({'AverageReturn_all_test_tasks': avg_test_return, 'Cvar0.95Return_all_test_tasks': cvar_test_return, 'epoch': epoch,
+                    'AverageReturn_all_train_tasks': avg_train_return, 'AverageTrainReturn_all_train_tasks': train_returns})
 
         for key, value in self.eval_statistics.items():
             logger.record_tabular(key, value)
